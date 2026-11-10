@@ -203,6 +203,12 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
         # Schema actually written to the dataset (blob columns retyped to lance.blob.v2).
         self._effective_pyarrow_schema = self._blob.build_effective_schema(self._pyarrow_schema)
 
+        # Creating the table and initializing MemWAL are commits, and a second
+        # initialize_mem_wal fails, so they run here once instead of racing on workers.
+        # Workers open the version this produces, which carries the MemWAL index.
+        if self._use_mem_wal:
+            self._version = self._ensure_mem_wal_dataset().version
+
     def _ensure_started(self) -> None:
         """Resolve the table if this checkpoint path runs before write_sink().start()."""
         if self._table_uri is None:
@@ -543,7 +549,8 @@ class LanceDataSink(DataSink[list[FragmentMetadata]]):
     def _write_mem_wal(
         self, micropartitions: Iterator[MicroPartition]
     ) -> Iterator[WriteResult[list[FragmentMetadata]]]:
-        ds = self._ensure_mem_wal_dataset()
+        assert self._table_uri is not None, "LanceDataSink.start() must run before writes"
+        ds = _cached_write_target(self._table_uri, self._version, self._storage_options)
         for micropartition in micropartitions:
             arrow_table = self._prepare_arrow_table(micropartition.to_arrow())
             wrapped = self._blob.wrap_table(arrow_table)

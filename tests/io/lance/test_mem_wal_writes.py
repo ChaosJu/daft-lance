@@ -233,6 +233,68 @@ class TestMemWalEnsureDataset:
         assert ds2.mem_wal_index_details() is not None
 
 
+@pytest.mark.skipif(
+    os.environ.get("DAFT_RUNNER") == "ray",
+    reason="the spies patch the driver process, while Ray writes from worker processes",
+)
+class TestMemWalWorkerOpens:
+    @staticmethod
+    def _append_counting(monkeypatch, path: str, num_batches: int) -> tuple[int, int]:
+        """Append ``num_batches`` batches; return (unpinned opens, initialize_mem_wal calls)."""
+        unpinned: list[str] = []
+        inits: list[int] = []
+        original_dataset = lance.dataset
+        original_init = lance.LanceDataset.initialize_mem_wal
+
+        def spy_dataset(*args, **kwargs):
+            if kwargs.get("version") is None:
+                unpinned.append(str(args[0] if args else kwargs.get("uri")))
+            return original_dataset(*args, **kwargs)
+
+        def spy_init(self, *args, **kwargs):
+            inits.append(1)
+            return original_init(self, *args, **kwargs)
+
+        monkeypatch.setattr(lance, "dataset", spy_dataset)
+        monkeypatch.setattr(lance.LanceDataset, "initialize_mem_wal", spy_init)
+        try:
+            df = daft.from_pydict({"id": list(range(num_batches * 2))}).into_batches(2)
+            df.write_lance(path, mode="append", use_mem_wal=True, compact_after_write=False)
+        finally:
+            monkeypatch.setattr(lance, "dataset", original_dataset)
+            monkeypatch.setattr(lance.LanceDataset, "initialize_mem_wal", original_init)
+        return len(unpinned), len(inits)
+
+    def test_unpinned_opens_do_not_grow_with_batches(self, lance_dataset_path, monkeypatch):
+        few = os.path.join(lance_dataset_path, "few")
+        many = os.path.join(lance_dataset_path, "many")
+        for path in (few, many):
+            daft.from_pydict({"id": [-1]}).write_lance(path, mode="create")
+
+        few_opens, _ = self._append_counting(monkeypatch, few, num_batches=2)
+        many_opens, _ = self._append_counting(monkeypatch, many, num_batches=10)
+
+        assert many_opens == few_opens
+
+    def test_initializes_mem_wal_once_on_driver(self, lance_dataset_path, monkeypatch):
+        daft.from_pydict({"id": [-1]}).write_lance(lance_dataset_path, mode="create")
+
+        _, inits = self._append_counting(monkeypatch, lance_dataset_path, num_batches=5)
+
+        assert inits == 1
+        assert lance.dataset(lance_dataset_path).mem_wal_index_details() is not None
+
+    def test_start_prepares_table_and_pins_initialized_version(self, lance_dataset_path):
+        target = os.path.join(lance_dataset_path, "new_table")
+        schema = daft.from_pydict({"a": [1]}).schema()
+        sink = LanceDataSink(uri=target, schema=schema, mode="create", use_mem_wal=True)
+
+        sink.start()
+
+        pinned = lance.dataset(target, version=sink._version)
+        assert pinned.mem_wal_index_details() is not None
+
+
 class TestMemWalWriteResult:
     def test_write_result_has_empty_fragments(self, lance_dataset_path):
         from daft.recordbatch import MicroPartition
